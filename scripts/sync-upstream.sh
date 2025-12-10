@@ -47,8 +47,8 @@ fi
 CURRENT_BRANCH=$(git branch --show-current)
 print_info "当前分支: $CURRENT_BRANCH"
 
-# 检查是否有未提交的更改
-if ! git diff-index --quiet HEAD --; then
+# 检查是否有未提交的更改（使用 git status --porcelain 更准确）
+if [ -n "$(git status --porcelain)" ]; then
     print_warning "检测到未提交的更改"
     read -p "是否要暂存这些更改？(y/n) " -n 1 -r
     echo
