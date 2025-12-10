@@ -52,6 +52,22 @@ class Application {
       await redis.connect()
       logger.success('✅ Redis connected successfully')
 
+      // ===== CUSTOM: 初始化 PostgreSQL =====
+      logger.info('🔄 Initializing PostgreSQL for conversation logging...')
+      const postgresService = require('../custom/services/postgresService')
+      const conversationLogger = require('../custom/services/conversationLoggerService')
+      try {
+        await postgresService.initialize()
+        await conversationLogger.initialize()
+        logger.success('✅ PostgreSQL initialized successfully for conversation logging')
+      } catch (error) {
+        logger.warn(
+          '⚠️  Failed to initialize PostgreSQL, conversation logging disabled:',
+          error.message
+        )
+      }
+      // ===== CUSTOM END =====
+
       // 💰 初始化价格服务
       logger.info('🔄 Initializing pricing service...')
       await pricingService.initialize()
@@ -286,10 +302,17 @@ class Application {
         try {
           const timer = logger.timer('health-check')
 
+          // ===== CUSTOM: 添加 PostgreSQL 健康检查 =====
+          const postgresService = require('../custom/services/postgresService')
+          // ===== CUSTOM END =====
+
           // 检查各个组件健康状态
-          const [redisHealth, loggerHealth] = await Promise.all([
+          const [redisHealth, loggerHealth, postgresHealth] = await Promise.all([
             this.checkRedisHealth(),
-            this.checkLoggerHealth()
+            this.checkLoggerHealth(),
+            // ===== CUSTOM: PostgreSQL 健康检查 =====
+            postgresService.healthCheck()
+            // ===== CUSTOM END =====
           ])
 
           const memory = process.memoryUsage()
@@ -328,7 +351,10 @@ class Application {
             },
             components: {
               redis: redisHealth,
-              logger: loggerHealth
+              logger: loggerHealth,
+              // ===== CUSTOM: 添加 PostgreSQL 状态 =====
+              postgres: postgresHealth
+              // ===== CUSTOM END =====
             },
             stats: logger.getStats()
           }

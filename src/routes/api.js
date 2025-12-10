@@ -14,6 +14,73 @@ const { updateRateLimitCounters } = require('../utils/rateLimitHelper')
 const { sanitizeUpstreamError } = require('../utils/errorSanitizer')
 const router = express.Router()
 
+// ===== CUSTOM: 对话记录 =====
+const conversationLogger = require('../../custom/services/conversationLoggerService')
+const pgConfig = require('../../custom/config/postgres')
+
+/**
+ * 响应内容捕获包装器
+ * 劫持 res.write 和 res.end 方法来捕获流式响应内容
+ * @param {Response} res - Express Response 对象
+ * @param {Function} onComplete - 完成回调，接收完整响应内容
+ */
+function wrapResponseForLogging(res, onComplete) {
+  const originalWrite = res.write.bind(res)
+  const originalEnd = res.end.bind(res)
+  const chunks = []
+  let totalSize = 0
+  const maxSize = pgConfig.logging.maxCaptureSize
+
+  res.write = function (chunk, encoding, callback) {
+    if (chunk && totalSize < maxSize) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding)
+      const chunkSize = buffer.length
+      if (totalSize + chunkSize <= maxSize) {
+        chunks.push(buffer)
+        totalSize += chunkSize
+      } else {
+        // 只添加剩余可容纳的部分
+        const remainingSize = maxSize - totalSize
+        if (remainingSize > 0) {
+          chunks.push(buffer.slice(0, remainingSize))
+          totalSize = maxSize
+        }
+      }
+    }
+    return originalWrite(chunk, encoding, callback)
+  }
+
+  res.end = function (chunk, encoding, callback) {
+    if (chunk && totalSize < maxSize) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding)
+      const chunkSize = buffer.length
+      if (totalSize + chunkSize <= maxSize) {
+        chunks.push(buffer)
+        totalSize += chunkSize
+      } else {
+        const remainingSize = maxSize - totalSize
+        if (remainingSize > 0) {
+          chunks.push(buffer.slice(0, remainingSize))
+          totalSize = maxSize
+        }
+      }
+    }
+
+    // 异步处理，不阻塞响应
+    const fullBody = Buffer.concat(chunks).toString('utf8')
+    setImmediate(() => {
+      try {
+        onComplete(fullBody)
+      } catch (error) {
+        logger.error('❌ Error in response logging callback:', error)
+      }
+    })
+
+    return originalEnd(chunk, encoding, callback)
+  }
+}
+// ===== CUSTOM END =====
+
 function queueRateLimitUpdate(rateLimitInfo, usageSummary, model, context = '') {
   if (!rateLimitInfo) {
     return Promise.resolve({ totalTokens: 0, totalCost: 0 })
@@ -41,6 +108,15 @@ function queueRateLimitUpdate(rateLimitInfo, usageSummary, model, context = '') 
 async function handleMessagesRequest(req, res) {
   try {
     const startTime = Date.now()
+
+    // ===== CUSTOM: 启用响应捕获 =====
+    let capturedResponse = ''
+    if (conversationLogger.isEnabled()) {
+      wrapResponseForLogging(res, (fullBody) => {
+        capturedResponse = fullBody
+      })
+    }
+    // ===== CUSTOM END =====
 
     // Claude 服务权限校验，阻止未授权的 Key
     if (
@@ -248,6 +324,38 @@ async function handleMessagesRequest(req, res) {
               logger.api(
                 `📊 Stream usage recorded (real) - Model: ${model}, Input: ${inputTokens}, Output: ${outputTokens}, Cache Create: ${cacheCreateTokens}, Cache Read: ${cacheReadTokens}, Total: ${inputTokens + outputTokens + cacheCreateTokens + cacheReadTokens} tokens`
               )
+
+              // ===== CUSTOM: 记录对话 =====
+              if (conversationLogger.isEnabled()) {
+                // 从捕获的 SSE 响应中提取文本内容
+                const responseContent = conversationLogger.extractContentFromSSE(capturedResponse)
+
+                conversationLogger
+                  .logConversation({
+                    apiKeyId: req.apiKey.id,
+                    apiKeyName: req.apiKey.name,
+                    apiKeyTag: req.apiKey.tag,
+                    accountId: usageAccountId,
+                    accountType: 'claude-official',
+                    model,
+                    requestMessages: req.body.messages,
+                    requestSystem: req.body.system,
+                    responseContent,
+                    responseRaw: null, // 流式响应不保存完整原始数据
+                    inputTokens,
+                    outputTokens,
+                    cacheCreateTokens,
+                    cacheReadTokens,
+                    totalTokens: inputTokens + outputTokens + cacheCreateTokens + cacheReadTokens,
+                    responseTimeMs: Date.now() - startTime,
+                    statusCode: 200,
+                    errorMessage: null,
+                    clientIp: req.ip,
+                    userAgent: req.headers['user-agent']
+                  })
+                  .catch((err) => logger.error('Failed to log conversation:', err))
+              }
+              // ===== CUSTOM END =====
             } else {
               logger.warn(
                 '⚠️ Usage callback triggered but data is incomplete:',

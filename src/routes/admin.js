@@ -9913,4 +9913,9 @@ router.post('/gemini-api-accounts/:id/reset-status', authenticateAdmin, async (r
   }
 })
 
+// ===== CUSTOM: 对话记录路由 =====
+const conversationLogsRoutes = require('../../custom/routes/conversationLogsRoutes')
+router.use('/conversation-logs', authenticateAdmin, conversationLogsRoutes)
+// ===== CUSTOM END =====
+
 module.exports = router

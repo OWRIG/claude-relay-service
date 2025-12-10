@@ -92,8 +92,8 @@ services:
     expose:
       - "6379"
     # 注意：如需本地调试访问，可取消下行注释（生产环境禁用）
-    # ports:
-    #   - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     volumes:
       - ./redis_data:/data
     command: redis-server --save 60 1 --appendonly yes --appendfsync everysec
@@ -108,6 +108,7 @@ services:
   # 📈 Redis Monitoring (Optional)
   redis-commander:
     image: rediscommander/redis-commander:latest
+    platform: linux/amd64  # 兼容 ARM64 (Apple Silicon)
     restart: unless-stopped
     ports:
       - "127.0.0.1:${REDIS_WEB_PORT:-8081}:8081"

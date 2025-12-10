@@ -15,6 +15,7 @@ const AccountsView = () => import('@/views/AccountsView.vue')
 const TutorialView = () => import('@/views/TutorialView.vue')
 const SettingsView = () => import('@/views/SettingsView.vue')
 const ApiStatsView = () => import('@/views/ApiStatsView.vue')
+const ConversationLogsView = () => import('@/views/ConversationLogsView.vue')
 
 const routes = [
   {
@@ -94,6 +95,18 @@ const routes = [
         path: '',
         name: 'Accounts',
         component: AccountsView
+      }
+    ]
+  },
+  {
+    path: '/conversation-logs',
+    component: MainLayout,
+    meta: { requiresAuth: true },
+    children: [
+      {
+        path: '',
+        name: 'ConversationLogs',
+        component: ConversationLogsView
       }
     ]
   },
