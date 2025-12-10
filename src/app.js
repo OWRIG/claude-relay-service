@@ -38,6 +38,7 @@ const {
   requestSizeLimit
 } = require('./middleware/auth')
 const { browserFallbackMiddleware } = require('./middleware/browserFallback')
+const conversationLogger = require('./middleware/conversationLogger')
 
 class Application {
   constructor() {
@@ -175,6 +176,7 @@ class Application {
         })
       )
       this.app.use(express.urlencoded({ extended: true, limit: '10mb' }))
+      this.app.use(conversationLogger)
       this.app.use(securityMiddleware)
 
       // 🎯 信任代理

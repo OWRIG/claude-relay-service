@@ -205,6 +205,11 @@ const config = {
     hotReload: process.env.HOT_RELOAD === 'true'
   },
 
+    // 🗂️ 对话日志配置
+  conversationLogging: {
+    enabled: process.env.CONVERSATION_LOGGING_ENABLED === 'true'
+  },
+
   // 📬 用户消息队列配置
   userMessageQueue: {
     enabled: process.env.USER_MESSAGE_QUEUE_ENABLED === 'true', // 默认关闭
@@ -212,6 +217,7 @@ const config = {
     timeoutMs: parseInt(process.env.USER_MESSAGE_QUEUE_TIMEOUT_MS) || 60000, // 队列等待超时（毫秒）
     lockTtlMs: 120000 // 锁租约TTL（毫秒），会在请求期间自动续租以防死锁
   }
+  
 }
 
 module.exports = config
