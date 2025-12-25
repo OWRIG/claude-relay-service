@@ -19,6 +19,7 @@ class PricingService {
     )
     this.localHashFile = path.join(this.dataDir, 'model_pricing.sha256')
     this.pricingData = null
+    this.customPricing = null // 用户自定义价格覆盖
     this.lastUpdated = null
     this.updateInterval = 24 * 60 * 60 * 1000 // 24小时
     this.hashCheckInterval = 10 * 60 * 1000 // 10分钟哈希校验
@@ -27,6 +28,9 @@ class PricingService {
     this.hashCheckTimer = null // 哈希轮询定时器
     this.updateTimer = null // 定时更新任务句柄
     this.hashSyncInProgress = false // 哈希同步状态
+
+    // 加载自定义价格配置（优先级最高）
+    this.loadCustomPricing()
 
     // 硬编码的 1 小时缓存价格（美元/百万 token）
     // ephemeral_5m 的价格使用 model_pricing.json 中的 cache_creation_input_token_cost
@@ -74,6 +78,33 @@ class PricingService {
       }
       // 未来可以添加更多 1M 模型的价格
     }
+  }
+
+  // 加载用户自定义价格配置
+  // Load custom pricing from config/customPricing.js (highest priority)
+  loadCustomPricing() {
+    const customPricingPath = path.join(process.cwd(), 'config', 'customPricing.js')
+    try {
+      if (fs.existsSync(customPricingPath)) {
+        delete require.cache[require.resolve(customPricingPath)]
+        this.customPricing = require(customPricingPath)
+        const modelCount = Object.keys(this.customPricing).length
+        logger.info(
+          `💰 Loaded custom pricing for ${modelCount} models from config/customPricing.js`
+        )
+      } else {
+        this.customPricing = null
+        logger.debug('💰 No custom pricing file found (config/customPricing.js)')
+      }
+    } catch (error) {
+      logger.warn(`⚠️ Failed to load custom pricing: ${error.message}`)
+      this.customPricing = null
+    }
+  }
+
+  // 重新加载自定义价格配置（支持热更新）
+  reloadCustomPricing() {
+    this.loadCustomPricing()
   }
 
   // 初始化价格服务
@@ -385,8 +416,19 @@ class PricingService {
   }
 
   // 获取模型价格信息
+  // 优先级: 自定义价格 > 动态价格 > 回退价格
   getModelPricing(modelName) {
-    if (!this.pricingData || !modelName) {
+    if (!modelName) {
+      return null
+    }
+
+    // 优先使用自定义价格（最高优先级）
+    if (this.customPricing && this.customPricing[modelName]) {
+      logger.debug(`💰 Using custom pricing for ${modelName}`)
+      return this.customPricing[modelName]
+    }
+
+    if (!this.pricingData) {
       return null
     }
 
@@ -651,6 +693,8 @@ class PricingService {
       initialized: this.pricingData !== null,
       lastUpdated: this.lastUpdated,
       modelCount: this.pricingData ? Object.keys(this.pricingData).length : 0,
+      customPricingEnabled: this.customPricing !== null,
+      customPricingModels: this.customPricing ? Object.keys(this.customPricing) : [],
       nextUpdate: this.lastUpdated
         ? new Date(this.lastUpdated.getTime() + this.updateInterval)
         : null
