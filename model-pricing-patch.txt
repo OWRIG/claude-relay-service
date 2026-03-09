@@ -1,0 +1,102 @@
+node <<'EOF'
+const fs = require('fs')
+const path = 'data/model_pricing.json'
+
+const patch = {
+  "qwen/qwen3.5-plus": {
+    "input_cost_per_token": 0.0000012,
+    "output_cost_per_token": 0.0000072,
+    "litellm_provider": "qwen",
+    "max_input_tokens": 1000000,
+    "max_output_tokens": 64000,
+    "max_tokens": 64000,
+    "mode": "chat",
+    "supports_prompt_caching": false
+  },
+  "volcengine/doubao-seed-2.0-pro": {
+    "input_cost_per_token": 0.00000134,
+    "output_cost_per_token": 0.00000671,
+    "litellm_provider": "volcengine",
+    "max_input_tokens": 256000,
+    "max_output_tokens": 32000,
+    "max_tokens": 32000,
+    "mode": "chat",
+    "supports_prompt_caching": false
+  },
+  "minimax/minimax-m2.5-lightning": {
+    "input_cost_per_token": 0.0000006,
+    "output_cost_per_token": 0.0000024,
+    "litellm_provider": "minimax",
+    "max_input_tokens": 204800,
+    "max_output_tokens": 131072,
+    "max_tokens": 131072,
+    "mode": "chat",
+    "supports_prompt_caching": false
+  },
+  "minimax/minimax-m2.5-highspeed": {
+    "input_cost_per_token": 0.0000006,
+    "output_cost_per_token": 0.0000024,
+    "litellm_provider": "minimax",
+    "max_input_tokens": 204800,
+    "max_output_tokens": 131072,
+    "max_tokens": 131072,
+    "mode": "chat",
+    "supports_prompt_caching": false
+  },
+  "minimax/minimax-m2.5": {
+    "input_cost_per_token": 0.0000003,
+    "output_cost_per_token": 0.0000012,
+    "litellm_provider": "minimax",
+    "max_input_tokens": 204800,
+    "max_output_tokens": 131072,
+    "max_tokens": 131072,
+    "mode": "chat",
+    "supports_prompt_caching": false
+  },
+  "z-ai/glm-5": {
+    "input_cost_per_token": 0.00000087,
+    "output_cost_per_token": 0.00000318,
+    "litellm_provider": "z-ai",
+    "max_input_tokens": 200000,
+    "max_output_tokens": 128000,
+    "max_tokens": 128000,
+    "mode": "chat",
+    "supports_prompt_caching": false
+  },
+  "stepfun/step-3.5-flash": {
+    "input_cost_per_token": 0.0000001,
+    "output_cost_per_token": 0.0000003,
+    "litellm_provider": "stepfun",
+    "max_input_tokens": 256000,
+    "max_output_tokens": 256000,
+    "max_tokens": 256000,
+    "mode": "chat",
+    "supports_prompt_caching": false
+  },
+  "z-ai/glm-4.7-flashx": {
+    "input_cost_per_token": 0.0000000715,
+    "output_cost_per_token": 0.000000425,
+    "litellm_provider": "z-ai",
+    "max_input_tokens": 200000,
+    "max_output_tokens": 128000,
+    "max_tokens": 128000,
+    "mode": "chat",
+    "supports_prompt_caching": false
+  }
+}
+
+let current = {}
+if (fs.existsSync(path)) {
+  current = JSON.parse(fs.readFileSync(path, 'utf8'))
+}
+
+const merged = { ...current, ...patch }
+fs.writeFileSync(path, JSON.stringify(merged, null, 2) + '\n')
+console.log(`updated ${path}`)
+console.log(`models merged: ${Object.keys(patch).length}`)
+EOF
+
+docker compose restart claude-relay
+
+grep -n 'minimax/minimax-m2.5-highspeed' data/model_pricing.json
+docker compose logs --tail=100 claude-relay
