@@ -56,6 +56,13 @@ services:
       
       # 📈 使用限制
       - DEFAULT_TOKEN_LIMIT=${DEFAULT_TOKEN_LIMIT:-1000000}
+
+      # 💰 模型价格镜像配置（可选）
+      - PRICE_MIRROR_BASE_URL=${PRICE_MIRROR_BASE_URL:-}
+      - PRICE_MIRROR_REPO=${PRICE_MIRROR_REPO:-}
+      - PRICE_MIRROR_BRANCH=${PRICE_MIRROR_BRANCH:-}
+      - PRICE_MIRROR_JSON_URL=${PRICE_MIRROR_JSON_URL:-}
+      - PRICE_MIRROR_HASH_URL=${PRICE_MIRROR_HASH_URL:-}
       
       # 📝 日志配置
       - LOG_LEVEL=${LOG_LEVEL:-info}
