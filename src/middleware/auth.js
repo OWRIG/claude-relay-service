@@ -1313,11 +1313,13 @@ const authenticateApiKey = async (req, res, next) => {
       restrictedModels: validation.keyData.restrictedModels,
       enableClientRestriction: validation.keyData.enableClientRestriction,
       allowedClients: validation.keyData.allowedClients,
-      allow1mContext: validation.keyData.allow1mContext,
       dailyCostLimit: validation.keyData.dailyCostLimit,
       dailyCost: validation.keyData.dailyCost,
       totalCostLimit: validation.keyData.totalCostLimit,
-      totalCost: validation.keyData.totalCost
+      totalCost: validation.keyData.totalCost,
+      enableOpenAIResponsesCodexAdaptation: validation.keyData.enableOpenAIResponsesCodexAdaptation,
+      enableOpenAIResponsesPayloadRules: validation.keyData.enableOpenAIResponsesPayloadRules,
+      openaiResponsesPayloadRules: validation.keyData.openaiResponsesPayloadRules
     }
 
     const authDuration = Date.now() - startTime
@@ -1766,6 +1768,7 @@ const requestLogger = (req, res, next) => {
 
   // 添加请求ID到请求对象
   req.requestId = requestId
+  req.requestStartedAt = start
   res.setHeader('X-Request-ID', requestId)
 
   // 获取客户端信息

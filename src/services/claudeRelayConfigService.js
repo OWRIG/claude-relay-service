@@ -5,6 +5,7 @@
 
 const redis = require('../models/redis')
 const logger = require('../utils/logger')
+const metadataUserIdHelper = require('../utils/metadataUserIdHelper')
 
 const CONFIG_KEY = 'claude_relay_config'
 const SESSION_BINDING_PREFIX = 'original_session_binding:'
@@ -26,6 +27,9 @@ const DEFAULT_CONFIG = {
   concurrentRequestQueueMaxSizeMultiplier: 0, // 并发数的倍数（默认0，仅使用固定值）
   concurrentRequestQueueTimeoutMs: 10000, // 排队超时（毫秒，默认10秒）
   concurrentRequestQueueMaxRedisFailCount: 5, // 连续 Redis 失败阈值（默认5次）
+  requestDetailCaptureEnabled: false, // 是否启用请求明细采集
+  requestDetailRetentionHours: 6, // 请求明细保留时间（小时）
+  requestDetailBodyPreviewEnabled: false, // 是否保存请求体预览快照
   // 排队健康检查配置
   concurrentRequestQueueHealthCheckEnabled: true, // 是否启用排队健康检查（默认开启）
   concurrentRequestQueueHealthThreshold: 0.8, // 健康检查阈值（P90 >= 超时 × 阈值时拒绝新请求）
@@ -41,7 +45,6 @@ const CONFIG_CACHE_TTL = 60000 // 1分钟缓存
 class ClaudeRelayConfigService {
   /**
    * 从 metadata.user_id 中提取原始 sessionId
-   * 格式: user_{64位十六进制}_account__session_{uuid}
    * @param {Object} requestBody - 请求体
    * @returns {string|null} 原始 sessionId 或 null
    */
@@ -49,10 +52,7 @@ class ClaudeRelayConfigService {
     if (!requestBody?.metadata?.user_id) {
       return null
     }
-
-    const userId = requestBody.metadata.user_id
-    const match = userId.match(/session_([a-f0-9-]{36})$/i)
-    return match ? match[1] : null
+    return metadataUserIdHelper.extractSessionId(requestBody.metadata.user_id)
   }
 
   /**

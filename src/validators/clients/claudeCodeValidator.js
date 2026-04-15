@@ -1,6 +1,12 @@
 const logger = require('../../utils/logger')
 const { CLIENT_DEFINITIONS } = require('../clientDefinitions')
 const { bestSimilarityByTemplates, SYSTEM_PROMPT_THRESHOLD } = require('../../utils/contents')
+const metadataUserIdHelper = require('../../utils/metadataUserIdHelper')
+
+// 0 = 所有条目都必须匹配（默认严格模式），N > 0 = 至少 N 条匹配即可通过
+const parsedMinMatches = parseInt(process.env.CLAUDE_CODE_MIN_SYSTEM_PROMPT_MATCHES)
+const MIN_SYSTEM_PROMPT_MATCHES =
+  Number.isInteger(parsedMinMatches) && parsedMinMatches >= 0 ? parsedMinMatches : 0
 
 /**
  * Claude Code CLI 验证器
@@ -36,11 +42,13 @@ class ClaudeCodeValidator {
   }
 
   /**
-   * 检查请求是否包含 Claude Code 系统提示词
+   * 检查请求中 system 条目的系统提示词匹配情况
    * @param {Object} body - 请求体
-   * @returns {boolean} 是否包含 Claude Code 系统提示词
+   * @param {number} [customThreshold] - 自定义相似度阈值
+   * @param {number} [minMatchCount] - 最少需要匹配的条目数；0 表示全部都必须匹配（严格模式）
+   * @returns {boolean}
    */
-  static hasClaudeCodeSystemPrompt(body, customThreshold) {
+  static hasClaudeCodeSystemPrompt(body, customThreshold, minMatchCount) {
     if (!body || typeof body !== 'object') {
       return false
     }
@@ -60,10 +68,25 @@ class ClaudeCodeValidator {
         ? customThreshold
         : SYSTEM_PROMPT_THRESHOLD
 
+    // minRequired: 0 = 所有条目都必须匹配；N > 0 = 至少 N 条匹配即可
+    const minRequired =
+      typeof minMatchCount === 'number' && Number.isInteger(minMatchCount) && minMatchCount > 0
+        ? minMatchCount
+        : 0
+
+    let matchCount = 0
+
     for (const entry of systemEntries) {
       const rawText = typeof entry?.text === 'string' ? entry.text : ''
       const { bestScore, templateId, maskedRaw } = bestSimilarityByTemplates(rawText)
-      if (bestScore < threshold) {
+
+      if (bestScore >= threshold) {
+        matchCount++
+        if (minRequired > 0 && matchCount >= minRequired) {
+          return true
+        }
+      } else if (minRequired === 0) {
+        // 严格模式：任意一条不匹配就失败
         logger.error(
           `Claude system prompt similarity below threshold: score=${bestScore.toFixed(4)}, threshold=${threshold}`
         )
@@ -76,55 +99,25 @@ class ClaudeCodeValidator {
         return false
       }
     }
-    return true
-  }
 
-  /**
-   * 判断是否存在 Claude Code 系统提示词（存在即返回 true）
-   * @param {Object} body - 请求体
-   * @param {number} [customThreshold] - 自定义阈值
-   * @returns {boolean} 是否存在 Claude Code 系统提示词
-   */
-  static includesClaudeCodeSystemPrompt(body, customThreshold) {
-    if (!body || typeof body !== 'object') {
-      return false
-    }
-
-    const model = typeof body.model === 'string' ? body.model : null
-    if (!model) {
-      return false
-    }
-
-    const systemEntries = Array.isArray(body.system) ? body.system : null
-    if (!systemEntries) {
-      return false
-    }
-
-    const threshold =
-      typeof customThreshold === 'number' && Number.isFinite(customThreshold)
-        ? customThreshold
-        : SYSTEM_PROMPT_THRESHOLD
-
-    let bestMatchScore = 0
-
-    for (const entry of systemEntries) {
-      const rawText = typeof entry?.text === 'string' ? entry.text : ''
-      const { bestScore } = bestSimilarityByTemplates(rawText)
-
-      if (bestScore > bestMatchScore) {
-        bestMatchScore = bestScore
-      }
-
-      if (bestScore >= threshold) {
-        return true
-      }
+    if (minRequired === 0) {
+      return true
     }
 
     logger.debug(
-      `Claude system prompt not detected: bestScore=${bestMatchScore.toFixed(4)}, threshold=${threshold}`
+      `Claude system prompt not detected: matchCount=${matchCount}, minRequired=${minRequired}`
     )
+    return matchCount >= minRequired
+  }
 
-    return false
+  /**
+   * 判断是否存在 Claude Code 系统提示词（至少一条匹配即返回 true）
+   * @param {Object} body - 请求体
+   * @param {number} [customThreshold] - 自定义阈值
+   * @returns {boolean}
+   */
+  static includesClaudeCodeSystemPrompt(body, customThreshold) {
+    return this.hasClaudeCodeSystemPrompt(body, customThreshold, 1)
   }
 
   /**
@@ -151,8 +144,8 @@ class ClaudeCodeValidator {
         return true
       }
 
-      // 3. 检查系统提示词是否为 Claude Code 的系统提示词
-      if (!this.hasClaudeCodeSystemPrompt(req.body)) {
+      // 3. 检查系统提示词匹配（由 CLAUDE_CODE_MIN_SYSTEM_PROMPT_MATCHES 控制匹配策略）
+      if (!this.hasClaudeCodeSystemPrompt(req.body, undefined, MIN_SYSTEM_PROMPT_MATCHES)) {
         logger.debug('Claude Code validation failed - missing or invalid Claude Code system prompt')
         return false
       }
@@ -188,26 +181,10 @@ class ClaudeCodeValidator {
       }
 
       const userId = req.body.metadata.user_id
-      // 格式: user_{64位字符串}_account__session_{哈希值}
-      // user_d98385411c93cd074b2cefd5c9831fe77f24a53e4ecdcd1f830bba586fe62cb9_account__session_17cf0fd3-d51b-4b59-977d-b899dafb3022
-      const userIdPattern = /^user_[a-fA-F0-9]{64}_account__session_[\w-]+$/
-
-      if (!userIdPattern.test(userId)) {
-        logger.debug(`Claude Code validation failed - invalid user_id format: ${userId}`)
-
-        // 提供更详细的错误信息
-        if (!userId.startsWith('user_')) {
-          logger.debug('user_id must start with "user_"')
-        } else {
-          const parts = userId.split('_')
-          if (parts.length < 4) {
-            logger.debug('user_id format is incomplete')
-          } else if (parts[1].length !== 64) {
-            logger.debug(`user hash must be 64 characters, got ${parts[1].length}`)
-          } else if (parts[2] !== 'account' || parts[3] !== '' || parts[4] !== 'session') {
-            logger.debug('user_id must contain "_account__session_"')
-          }
-        }
+      if (!metadataUserIdHelper.isValid(userId)) {
+        logger.debug(
+          `Claude Code validation failed - invalid user_id format: ${typeof userId === 'string' ? userId.slice(0, 80) : typeof userId}`
+        )
         return false
       }
 
