@@ -13,7 +13,6 @@ const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
 const userMessageQueueService = require('../userMessageQueueService')
 const { isStreamWritable } = require('../../utils/streamHelper')
 const { filterForClaude } = require('../../utils/headerFilter')
-const { mergeConsecutiveAnthropicMessages } = require('../../utils/anthropicMessageNormalizer')
 
 class ClaudeConsoleRelayService {
   constructor() {
@@ -159,7 +158,10 @@ class ClaudeConsoleRelayService {
       }
 
       // 创建修改后的请求体
-      const modifiedRequestBody = this._buildModifiedRequestBody(requestBody, mappedModel)
+      const modifiedRequestBody = {
+        ...requestBody,
+        model: mappedModel
+      }
 
       // 模型兼容性检查已经在调度器中完成，这里不需要再检查
 
@@ -642,7 +644,10 @@ class ClaudeConsoleRelayService {
       }
 
       // 创建修改后的请求体
-      const modifiedRequestBody = this._buildModifiedRequestBody(requestBody, mappedModel)
+      const modifiedRequestBody = {
+        ...requestBody,
+        model: mappedModel
+      }
 
       // 模型兼容性检查已经在调度器中完成，这里不需要再检查
 
@@ -1367,19 +1372,6 @@ class ClaudeConsoleRelayService {
     // 使用统一的 headerFilter 工具类（白名单模式）
     // 与 claudeRelayService 保持一致，避免透传 CDN headers 触发上游 API 安全检查
     return filterForClaude(clientHeaders)
-  }
-
-  _buildModifiedRequestBody(requestBody, mappedModel) {
-    const modifiedRequestBody = {
-      ...requestBody,
-      model: mappedModel
-    }
-
-    if (Array.isArray(requestBody?.messages)) {
-      modifiedRequestBody.messages = mergeConsecutiveAnthropicMessages(requestBody.messages)
-    }
-
-    return modifiedRequestBody
   }
 
   // 🕐 更新最后使用时间

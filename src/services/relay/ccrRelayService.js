@@ -6,7 +6,6 @@ const { parseVendorPrefixedModel } = require('../../utils/modelHelper')
 const userMessageQueueService = require('../userMessageQueueService')
 const { isStreamWritable } = require('../../utils/streamHelper')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
-const { mergeConsecutiveAnthropicMessages } = require('../../utils/anthropicMessageNormalizer')
 
 class CcrRelayService {
   constructor() {
@@ -117,7 +116,11 @@ class CcrRelayService {
         }
       }
 
-      const modifiedRequestBody = this._buildModifiedRequestBody(requestBody, mappedModel)
+      // 创建修改后的请求体，使用去前缀后的模型名
+      const modifiedRequestBody = {
+        ...requestBody,
+        model: mappedModel
+      }
 
       // 创建代理agent
       const proxyAgent = ccrAccountService._createProxyAgent(account.proxy)
@@ -477,7 +480,11 @@ class CcrRelayService {
         }
       }
 
-      const modifiedRequestBody = this._buildModifiedRequestBody(requestBody, mappedModel)
+      // 创建修改后的请求体，使用去前缀后的模型名
+      const modifiedRequestBody = {
+        ...requestBody,
+        model: mappedModel
+      }
 
       // 创建代理agent
       const proxyAgent = ccrAccountService._createProxyAgent(account.proxy)
@@ -945,19 +952,6 @@ class CcrRelayService {
     }
 
     return filteredHeaders
-  }
-
-  _buildModifiedRequestBody(requestBody, mappedModel) {
-    const modifiedRequestBody = {
-      ...requestBody,
-      model: mappedModel
-    }
-
-    if (Array.isArray(requestBody?.messages)) {
-      modifiedRequestBody.messages = mergeConsecutiveAnthropicMessages(requestBody.messages)
-    }
-
-    return modifiedRequestBody
   }
 
   // ⏰ 更新账户最后使用时间
