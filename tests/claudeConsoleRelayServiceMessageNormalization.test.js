@@ -78,7 +78,7 @@ describe('ClaudeConsoleRelayService message normalization', () => {
     makeStreamRequest.mockRestore()
   })
 
-  test('merges consecutive assistant blocks and promotes Gemini tool signatures', async () => {
+  test('merges consecutive assistant blocks and preserves provider redacted thinking', async () => {
     const requestBody = {
       model: 'gemini-3.5-flash',
       stream: true,
@@ -130,8 +130,9 @@ describe('ClaudeConsoleRelayService message normalization', () => {
     expect(forwardedBody.messages[1]).toMatchObject({
       role: 'assistant',
       content: [
-        { type: 'thinking', thinking: 'Inspecting skills', signature: 'rosetta-ai/signature' },
+        { type: 'thinking', thinking: 'Inspecting skills', signature: '' },
         { type: 'text', text: 'I will search skill files.' },
+        { type: 'redacted_thinking', data: 'rosetta-ai/signature' },
         {
           type: 'tool_use',
           id: 'toolu_1',
