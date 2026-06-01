@@ -15,6 +15,10 @@ const { isStreamWritable } = require('../../utils/streamHelper')
 const { filterForClaude } = require('../../utils/headerFilter')
 const { mergeConsecutiveAnthropicMessages } = require('../../utils/anthropicMessageNormalizer')
 
+function isGeminiModel(model) {
+  return typeof model === 'string' && model.toLowerCase().includes('gemini')
+}
+
 class ClaudeConsoleRelayService {
   constructor() {
     this.defaultUserAgent = 'claude-cli/2.0.52 (external, cli)'
@@ -1376,7 +1380,9 @@ class ClaudeConsoleRelayService {
     }
 
     if (Array.isArray(requestBody?.messages)) {
-      modifiedRequestBody.messages = mergeConsecutiveAnthropicMessages(requestBody.messages)
+      modifiedRequestBody.messages = mergeConsecutiveAnthropicMessages(requestBody.messages, {
+        promoteRedactedThinkingToolSignatures: isGeminiModel(mappedModel)
+      })
     }
 
     return modifiedRequestBody
