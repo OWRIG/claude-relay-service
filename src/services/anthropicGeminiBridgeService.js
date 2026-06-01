@@ -52,6 +52,7 @@ const {
   dumpAntigravityStreamEvent,
   dumpAntigravityStreamSummary
 } = require('../utils/antigravityUpstreamResponseDump')
+const { mergeConsecutiveAnthropicMessages } = require('../utils/anthropicMessageNormalizer')
 
 // ============================================================================
 // 常量定义
@@ -570,6 +571,7 @@ function normalizeAnthropicMessages(messages, { vendor = null } = {}) {
     return messages
   }
 
+  const mergedMessages = mergeConsecutiveAnthropicMessages(messages)
   const pendingToolUseIds = []
   const isIgnorableTrailingText = (part) => {
     if (!part || part.type !== 'text') {
@@ -641,7 +643,7 @@ function normalizeAnthropicMessages(messages, { vendor = null } = {}) {
 
   const normalized = []
 
-  for (const message of messages) {
+  for (const message of mergedMessages) {
     if (!message || !Array.isArray(message.content)) {
       normalized.push(message)
       continue
