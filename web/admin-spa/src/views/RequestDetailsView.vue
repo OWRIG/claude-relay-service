@@ -112,8 +112,8 @@
                 {{ formatPercent(summary.cacheHitRate) }}
               </p>
               <p class="summary-sub">
-                读 {{ formatNumber(summary.cacheReadTokens) }} / 建
-                {{ formatCacheCreate(summary.cacheCreateTokens, summary.cacheCreateNotApplicable) }}
+                读 / (输入 + 读 + 建)：{{ formatNumber(summary.cacheHitNumerator) }} /
+                {{ formatNumber(summary.cacheHitDenominator) }}
               </p>
             </div>
             <div class="summary-card">
@@ -604,6 +604,7 @@ const exporting = ref(false)
 const requestDetailBodyPreviewPurging = ref(false)
 const detailVisible = ref(false)
 const activeRequestId = ref('')
+const activeSnapshotId = ref(null)
 const captureEnabled = ref(false)
 const retentionHours = ref(6)
 const bodyPreviewEnabled = ref(false)
@@ -649,6 +650,9 @@ const summary = reactive({
   totalCost: 0,
   avgDurationMs: 0,
   cacheHitRate: 0,
+  cacheHitNumerator: 0,
+  cacheHitDenominator: 0,
+  cacheHitFormula: 'cacheReadTokens / (inputTokens + cacheReadTokens + cacheCreateTokens)',
   cacheCreateNotApplicable: false
 })
 
@@ -695,7 +699,7 @@ const areDateRangesEqual = (currentRange = [], nextRange = []) => {
   )
 }
 
-const buildParams = (page) => {
+const buildParams = (page, snapshotId = activeSnapshotId.value) => {
   const params = {
     page,
     pageSize: pagination.pageSize,
@@ -718,6 +722,8 @@ const buildParams = (page) => {
     }
   }
 
+  if (snapshotId) params.snapshotId = snapshotId
+
   return params
 }
 
@@ -725,6 +731,7 @@ const syncResponseState = (data) => {
   captureEnabled.value = data.captureEnabled === true
   retentionHours.value = data.retentionHours || 6
   bodyPreviewEnabled.value = data.bodyPreviewEnabled === true
+  activeSnapshotId.value = data.snapshotId || null
   records.value = data.records || []
 
   const pageInfo = data.pagination || {}
@@ -746,6 +753,7 @@ const syncResponseState = (data) => {
       nextRange.every(Boolean) &&
       !areDateRangesEqual(filters.dateRange || [], nextRange)
     ) {
+      suppressDateRangeWatch = true
       filters.dateRange = nextRange
     }
   }
@@ -764,7 +772,18 @@ const syncResponseState = (data) => {
   summary.totalCost = summaryData.totalCost || 0
   summary.avgDurationMs = summaryData.avgDurationMs || 0
   summary.cacheHitRate = summaryData.cacheHitRate || 0
+  summary.cacheHitNumerator = summaryData.cacheHitNumerator || 0
+  summary.cacheHitDenominator = summaryData.cacheHitDenominator || 0
+  summary.cacheHitFormula =
+    summaryData.cacheHitFormula ||
+    'cacheReadTokens / (inputTokens + cacheReadTokens + cacheCreateTokens)'
   summary.cacheCreateNotApplicable = summaryData.cacheCreateNotApplicable === true
+}
+
+let suppressDateRangeWatch = false
+
+const invalidateSnapshot = () => {
+  activeSnapshotId.value = null
 }
 
 const fetchRecords = async (page = pagination.currentPage) => {
@@ -801,10 +820,12 @@ const handleSizeChange = (size) => {
 }
 
 const refreshRecords = () => {
+  invalidateSnapshot()
   fetchRecords(pagination.currentPage)
 }
 
 const resetFilters = () => {
+  invalidateSnapshot()
   filters.dateRange = null
   filters.keyword = ''
   filters.apiKeyId = ''
@@ -876,14 +897,16 @@ const exportCsv = async () => {
     let page = 1
     let totalPages = 1
     let totalRecords = 0
+    let snapshotId = activeSnapshotId.value
     const maxPages = 100
 
     while (page <= totalPages && page <= maxPages) {
       const response = await getRequestDetailsApi({
-        ...buildParams(page),
+        ...buildParams(page, snapshotId),
         pageSize: 200
       })
       const payload = response.data || {}
+      snapshotId = payload.snapshotId || null
       aggregated.push(...(payload.records || []))
       totalPages = payload.pagination?.totalPages || 1
       if (page === 1) {
@@ -990,6 +1013,7 @@ const formatReasoning = (value) => value || '-'
 
 const debouncedKeywordFetch = debounce(() => {
   pagination.currentPage = 1
+  invalidateSnapshot()
   fetchRecords(1)
 }, 300)
 
@@ -1005,6 +1029,7 @@ watch(
   () => {
     debouncedKeywordFetch.cancel()
     pagination.currentPage = 1
+    invalidateSnapshot()
     fetchRecords(1)
   }
 )
@@ -1012,7 +1037,12 @@ watch(
 watch(
   () => filters.dateRange,
   () => {
+    if (suppressDateRangeWatch) {
+      suppressDateRangeWatch = false
+      return
+    }
     pagination.currentPage = 1
+    invalidateSnapshot()
     fetchRecords(1)
   },
   { deep: true }

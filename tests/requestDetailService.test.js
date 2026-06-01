@@ -27,17 +27,22 @@ jest.mock('../src/services/account/openaiResponsesAccountService', () => ({
 jest.mock('../src/services/account/azureOpenaiAccountService', () => ({ getAccount: jest.fn() }))
 jest.mock('../src/services/account/droidAccountService', () => ({ getAccount: jest.fn() }))
 jest.mock('../src/services/account/bedrockAccountService', () => ({ getAccount: jest.fn() }))
+jest.mock('../src/utils/costCalculator', () => ({
+  calculateCost: jest.fn()
+}))
 
 const redis = require('../src/models/redis')
 const claudeRelayConfigService = require('../src/services/claudeRelayConfigService')
 const claudeAccountService = require('../src/services/account/claudeAccountService')
+const claudeConsoleAccountService = require('../src/services/account/claudeConsoleAccountService')
 const openaiAccountService = require('../src/services/account/openaiAccountService')
 const bedrockAccountService = require('../src/services/account/bedrockAccountService')
+const CostCalculator = require('../src/utils/costCalculator')
 const requestDetailService = require('../src/services/requestDetailService')
 
 describe('requestDetailService', () => {
   beforeEach(() => {
-    jest.clearAllMocks()
+    jest.resetAllMocks()
     jest.useFakeTimers().setSystemTime(Date.parse('2026-04-07T18:00:00.000Z'))
   })
 
@@ -128,8 +133,8 @@ describe('requestDetailService', () => {
           inputTokens: 100,
           outputTokens: 50,
           cacheReadTokens: 60,
-          cacheCreateTokens: 40,
-          totalTokens: 250,
+          cacheCreateTokens: 0,
+          totalTokens: 210,
           cost: 0.5,
           durationMs: 1200,
           requestBodySnapshot: { model: 'gpt-5.4' }
@@ -157,6 +162,8 @@ describe('requestDetailService', () => {
     expect(result.summary.totalRequests).toBe(1)
     expect(result.summary.cacheCreateTokens).toBe(0)
     expect(result.summary.cacheCreateNotApplicable).toBe(true)
+    expect(result.summary.cacheHitNumerator).toBe(60)
+    expect(result.summary.cacheHitDenominator).toBe(160)
     expect(result.summary.cacheHitRate).toBe(37.5)
     expect(result.availableFilters.models).toEqual(['gpt-5.4'])
     expect(result.filters.hasCustomDateRange).toBe(true)
@@ -194,7 +201,7 @@ describe('requestDetailService', () => {
           inputTokens: 100,
           outputTokens: 20,
           cacheReadTokens: 60,
-          cacheCreateTokens: 40,
+          cacheCreateTokens: 0,
           totalTokens: 180,
           cost: 0.3,
           durationMs: 500
@@ -228,7 +235,12 @@ describe('requestDetailService', () => {
     expect(result.summary.totalRequests).toBe(2)
     expect(result.summary.cacheCreateNotApplicable).toBe(false)
     expect(result.summary.cacheCreateTokens).toBe(30)
-    expect(result.summary.cacheHitRate).toBe(40.91)
+    expect(result.summary.cacheHitNumerator).toBe(90)
+    expect(result.summary.cacheHitDenominator).toBe(310)
+    expect(result.summary.cacheHitFormula).toBe(
+      'cacheReadTokens / (inputTokens + cacheReadTokens + cacheCreateTokens)'
+    )
+    expect(result.summary.cacheHitRate).toBe(29.03)
   })
 
   test('listRequestDetails treats azure-openai cache hits as openai-style metrics', async () => {
@@ -274,6 +286,97 @@ describe('requestDetailService', () => {
     expect(result.records[0].cacheHitRate).toBe(37.5)
     expect(result.summary.cacheCreateTokens).toBe(0)
     expect(result.summary.cacheHitRate).toBe(37.5)
+  })
+
+  test('reads retained zero-cost unknown model records with recomputed display cost', async () => {
+    claudeRelayConfigService.getConfig.mockResolvedValue({
+      requestDetailCaptureEnabled: true,
+      requestDetailRetentionHours: 6,
+      requestDetailBodyPreviewEnabled: true
+    })
+
+    redis.getApiKey.mockResolvedValue({ name: 'Mimo Key' })
+    claudeConsoleAccountService.getAccount.mockResolvedValue({ name: 'Claude Console' })
+    CostCalculator.calculateCost.mockReturnValue({
+      costs: {
+        input: 0.051618,
+        output: 0.000765,
+        cacheCreate: 0,
+        cacheWrite: 0,
+        cacheRead: 0.0006144,
+        total: 0.0529974
+      },
+      debug: {
+        usedFallbackPricing: true,
+        pricingSource: 'unknown-fallback'
+      },
+      usingDynamicPricing: false
+    })
+
+    const storedRecord = JSON.stringify({
+      requestId: 'req_mimo',
+      timestamp: '2026-04-07T12:00:00.000Z',
+      endpoint: '/api/v1/messages',
+      method: 'POST',
+      apiKeyId: 'key_mimo',
+      accountId: 'acct_mimo',
+      accountType: 'claude-console',
+      model: 'mimo-v2.5-pro',
+      inputTokens: 17206,
+      outputTokens: 51,
+      cacheReadTokens: 2048,
+      cacheCreateTokens: 0,
+      totalTokens: 19305,
+      cost: 0,
+      realCost: 0,
+      realCostBreakdown: {
+        input: 0,
+        output: 0,
+        cacheCreate: 0,
+        cacheRead: 0
+      },
+      durationMs: 5662
+    })
+    const client = {
+      zrangebyscore: jest.fn().mockResolvedValue(['req_mimo', '1775563200000']),
+      mget: jest.fn().mockResolvedValue([storedRecord]),
+      get: jest.fn().mockResolvedValue(storedRecord),
+      set: jest.fn().mockResolvedValue('OK')
+    }
+    redis.getClient.mockReturnValue(client)
+
+    const result = await requestDetailService.listRequestDetails({
+      startDate: '2026-04-07T00:00:00.000Z',
+      endDate: '2026-04-07T23:59:59.000Z'
+    })
+    const detail = await requestDetailService.getRequestDetail('req_mimo')
+
+    expect(result.records).toHaveLength(1)
+    expect(result.records[0].cacheHitRate).toBe(10.64)
+    expect(result.records[0].cacheHitNumerator).toBe(2048)
+    expect(result.records[0].cacheHitDenominator).toBe(19254)
+    expect(result.records[0].cost).toBe(0.052997)
+    expect(result.records[0].realCost).toBe(0.052997)
+    expect(result.records[0].costRecomputed).toBe(true)
+    expect(result.records[0].usedFallbackPricing).toBe(true)
+    expect(result.records[0].pricingSource).toBe('unknown-fallback')
+    expect(result.records[0].realCostBreakdown).toEqual(
+      expect.objectContaining({
+        input: 0.051618,
+        output: 0.000765,
+        cacheRead: 0.0006144,
+        total: 0.0529974
+      })
+    )
+    expect(result.summary.cacheHitRate).toBe(10.64)
+    expect(result.summary.totalCost).toBe(0.052997)
+    expect(detail.record.cost).toBe(0.052997)
+    expect(detail.record.costRecomputed).toBe(true)
+    expect(client.set).not.toHaveBeenCalledWith(
+      'request_detail:item:req_mimo',
+      expect.any(String),
+      expect.anything()
+    )
   })
 
   test('listRequestDetails still exposes retained data when capture is disabled', async () => {
@@ -681,35 +784,33 @@ describe('requestDetailService', () => {
     redis.getApiKey.mockResolvedValue({ name: 'Primary Key' })
     openaiAccountService.getAccount.mockResolvedValue({ name: 'OpenAI Main' })
 
-    const records = []
+    const recordsByKey = {}
     const pointerEntries = []
     for (let i = 0; i < 5; i++) {
       const ts = 1775563200000 + i * 3600000
       pointerEntries.push(`req_${i}`, String(ts))
-      records.push(
-        JSON.stringify({
-          requestId: `req_${i}`,
-          timestamp: new Date(ts).toISOString(),
-          endpoint: '/openai/v1/responses',
-          method: 'POST',
-          apiKeyId: 'key_1',
-          accountId: 'acct_1',
-          accountType: 'openai',
-          model: 'gpt-5.4',
-          inputTokens: 100,
-          outputTokens: 50,
-          cacheReadTokens: 0,
-          cacheCreateTokens: 0,
-          totalTokens: 150,
-          cost: 0.5,
-          durationMs: 1200
-        })
-      )
+      recordsByKey[`request_detail:item:req_${i}`] = JSON.stringify({
+        requestId: `req_${i}`,
+        timestamp: new Date(ts).toISOString(),
+        endpoint: '/openai/v1/responses',
+        method: 'POST',
+        apiKeyId: 'key_1',
+        accountId: 'acct_1',
+        accountType: 'openai',
+        model: 'gpt-5.4',
+        inputTokens: 100,
+        outputTokens: 50,
+        cacheReadTokens: 0,
+        cacheCreateTokens: 0,
+        totalTokens: 150,
+        cost: 0.5,
+        durationMs: 1200
+      })
     }
 
     redis.getClient.mockReturnValue({
       zrangebyscore: jest.fn().mockResolvedValue(pointerEntries),
-      mget: jest.fn().mockResolvedValue(records)
+      mget: jest.fn(async (keys) => keys.map((key) => recordsByKey[key] || null))
     })
 
     const result = await requestDetailService.listRequestDetails({
@@ -725,6 +826,955 @@ describe('requestDetailService', () => {
     expect(result.records[0].accountName).toBe('OpenAI Main')
     expect(result.availableFilters.models).toEqual(['gpt-5.4'])
     expect(result.summary.totalRequests).toBe(5)
+  })
+
+  test('listRequestDetails creates a snapshot and reuses it across pages', async () => {
+    claudeRelayConfigService.getConfig.mockResolvedValue({
+      requestDetailCaptureEnabled: true,
+      requestDetailRetentionHours: 6,
+      requestDetailBodyPreviewEnabled: true
+    })
+
+    redis.getApiKey.mockResolvedValue({ name: 'Primary Key' })
+    openaiAccountService.getAccount.mockResolvedValue({ name: 'OpenAI Main' })
+
+    const recordsByKey = {}
+    const pointerEntries = []
+    for (let i = 0; i < 4; i++) {
+      const ts = 1775563200000 + i * 3600000
+      pointerEntries.push(`req_${i}`, String(ts))
+      recordsByKey[`request_detail:item:req_${i}`] = JSON.stringify({
+        requestId: `req_${i}`,
+        timestamp: new Date(ts).toISOString(),
+        endpoint: '/openai/v1/responses',
+        method: 'POST',
+        apiKeyId: 'key_1',
+        accountId: 'acct_1',
+        accountType: 'openai',
+        model: 'gpt-5.4',
+        inputTokens: 100,
+        outputTokens: 50,
+        totalTokens: 150,
+        cost: 0.5,
+        durationMs: 1200
+      })
+    }
+
+    const snapshots = new Map()
+    const client = {
+      zrangebyscore: jest.fn().mockResolvedValue(pointerEntries),
+      mget: jest.fn(async (keys) => keys.map((key) => recordsByKey[key] || null)),
+      set: jest.fn(async (key, value) => {
+        snapshots.set(key, value)
+        return 'OK'
+      }),
+      get: jest.fn(async (key) => snapshots.get(key) || null),
+      expire: jest.fn().mockResolvedValue(1)
+    }
+    redis.getClient.mockReturnValue(client)
+
+    const firstPage = await requestDetailService.listRequestDetails({
+      startDate: '2026-04-07T00:00:00.000Z',
+      endDate: '2026-04-08T23:59:59.000Z',
+      pageSize: 2,
+      page: 1
+    })
+
+    expect(firstPage.snapshotId).toBeTruthy()
+    expect(firstPage.records.map((record) => record.requestId)).toEqual(['req_3', 'req_2'])
+    expect(client.set).toHaveBeenCalledWith(
+      expect.stringMatching(/^request_detail:query_snapshot:/),
+      expect.any(String),
+      'EX',
+      30
+    )
+
+    const secondPage = await requestDetailService.listRequestDetails({
+      startDate: '2026-04-07T00:00:00.000Z',
+      endDate: '2026-04-08T23:59:59.000Z',
+      pageSize: 2,
+      page: 2,
+      snapshotId: firstPage.snapshotId
+    })
+
+    expect(secondPage.snapshotId).toBe(firstPage.snapshotId)
+    expect(secondPage.records.map((record) => record.requestId)).toEqual(['req_1', 'req_0'])
+    expect(client.zrangebyscore).toHaveBeenCalledTimes(1)
+    expect(client.get).toHaveBeenCalledWith(`request_detail:query_snapshot:${firstPage.snapshotId}`)
+    expect(client.expire).toHaveBeenCalledWith(
+      `request_detail:query_snapshot:${firstPage.snapshotId}`,
+      30
+    )
+  })
+
+  test('listRequestDetails rebuilds the snapshot when filters change', async () => {
+    claudeRelayConfigService.getConfig.mockResolvedValue({
+      requestDetailCaptureEnabled: true,
+      requestDetailRetentionHours: 6,
+      requestDetailBodyPreviewEnabled: true
+    })
+
+    redis.getApiKey.mockImplementation(async (keyId) => ({ name: `Key ${keyId}` }))
+    openaiAccountService.getAccount.mockResolvedValue({ name: 'OpenAI Main' })
+
+    const recordsByKey = {
+      'request_detail:item:req_1': JSON.stringify({
+        requestId: 'req_1',
+        timestamp: '2026-04-07T12:00:00.000Z',
+        endpoint: '/openai/v1/responses',
+        method: 'POST',
+        apiKeyId: 'key_1',
+        accountId: 'acct_1',
+        accountType: 'openai',
+        model: 'gpt-5.4',
+        inputTokens: 10,
+        outputTokens: 5,
+        totalTokens: 15,
+        cost: 0.1,
+        durationMs: 400
+      }),
+      'request_detail:item:req_2': JSON.stringify({
+        requestId: 'req_2',
+        timestamp: '2026-04-07T13:00:00.000Z',
+        endpoint: '/openai/v1/responses',
+        method: 'POST',
+        apiKeyId: 'key_2',
+        accountId: 'acct_1',
+        accountType: 'openai',
+        model: 'gpt-5.4',
+        inputTokens: 20,
+        outputTokens: 5,
+        totalTokens: 25,
+        cost: 0.2,
+        durationMs: 500
+      })
+    }
+
+    const snapshots = new Map()
+    const client = {
+      zrangebyscore: jest
+        .fn()
+        .mockResolvedValue(['req_1', '1775563200000', 'req_2', '1775566800000']),
+      mget: jest.fn(async (keys) => keys.map((key) => recordsByKey[key] || null)),
+      set: jest.fn(async (key, value) => {
+        snapshots.set(key, value)
+        return 'OK'
+      }),
+      get: jest.fn(async (key) => snapshots.get(key) || null),
+      expire: jest.fn().mockResolvedValue(1)
+    }
+    redis.getClient.mockReturnValue(client)
+
+    const firstQuery = await requestDetailService.listRequestDetails({
+      startDate: '2026-04-07T00:00:00.000Z',
+      endDate: '2026-04-07T23:59:59.000Z',
+      apiKeyId: 'key_1'
+    })
+
+    const secondQuery = await requestDetailService.listRequestDetails({
+      startDate: '2026-04-07T00:00:00.000Z',
+      endDate: '2026-04-07T23:59:59.000Z',
+      apiKeyId: 'key_2',
+      snapshotId: firstQuery.snapshotId
+    })
+
+    expect(client.zrangebyscore).toHaveBeenCalledTimes(2)
+    expect(secondQuery.records).toHaveLength(1)
+    expect(secondQuery.records[0].apiKeyId).toBe('key_2')
+    expect(secondQuery.snapshotId).toBeTruthy()
+    expect(secondQuery.snapshotId).not.toBe(firstQuery.snapshotId)
+  })
+
+  test('listRequestDetails rejects stale snapshot when explicit date range changes', async () => {
+    claudeRelayConfigService.getConfig.mockResolvedValue({
+      requestDetailCaptureEnabled: true,
+      requestDetailRetentionHours: 6,
+      requestDetailBodyPreviewEnabled: true
+    })
+
+    redis.getApiKey.mockResolvedValue({ name: 'Key' })
+    openaiAccountService.getAccount.mockResolvedValue({ name: 'Acct' })
+
+    const recordsByKey = {}
+    const pointerEntries = []
+    for (let i = 0; i < 2; i++) {
+      const ts = Date.now() - (1 - i) * 3600000
+      pointerEntries.push(`req_${i}`, String(ts))
+      recordsByKey[`request_detail:item:req_${i}`] = JSON.stringify({
+        requestId: `req_${i}`,
+        timestamp: new Date(ts).toISOString(),
+        endpoint: '/v1/messages',
+        method: 'POST',
+        apiKeyId: 'key_1',
+        accountId: 'acct_1',
+        accountType: 'claude',
+        model: 'claude-sonnet-4-20250514',
+        inputTokens: 10,
+        outputTokens: 5,
+        totalTokens: 15,
+        cost: 0.1,
+        durationMs: 300
+      })
+    }
+
+    const snapshots = new Map()
+    const client = {
+      zrangebyscore: jest.fn().mockResolvedValue(pointerEntries),
+      mget: jest.fn(async (keys) => keys.map((key) => recordsByKey[key] || null)),
+      set: jest.fn(async (key, value) => {
+        snapshots.set(key, value)
+        return 'OK'
+      }),
+      get: jest.fn(async (key) => snapshots.get(key) || null),
+      expire: jest.fn().mockResolvedValue(1)
+    }
+    redis.getClient.mockReturnValue(client)
+
+    const now = Date.now()
+    const rangeA = {
+      startDate: new Date(now - 5 * 3600000).toISOString(),
+      endDate: new Date(now - 3 * 3600000).toISOString()
+    }
+    const rangeB = {
+      startDate: new Date(now - 2 * 3600000).toISOString(),
+      endDate: new Date(now - 1 * 3600000).toISOString()
+    }
+
+    const firstQuery = await requestDetailService.listRequestDetails(rangeA)
+
+    expect(firstQuery.snapshotId).toBeTruthy()
+
+    // Same non-date filters, different date range, stale snapshotId —
+    // must NOT reuse the old snapshot.
+    const secondQuery = await requestDetailService.listRequestDetails({
+      ...rangeB,
+      snapshotId: firstQuery.snapshotId
+    })
+
+    expect(client.zrangebyscore).toHaveBeenCalledTimes(2)
+    expect(secondQuery.snapshotId).toBeTruthy()
+    expect(secondQuery.snapshotId).not.toBe(firstQuery.snapshotId)
+  })
+
+  test('listRequestDetails reuses snapshot for startDate-only queries after time advances', async () => {
+    claudeRelayConfigService.getConfig.mockResolvedValue({
+      requestDetailCaptureEnabled: true,
+      requestDetailRetentionHours: 6,
+      requestDetailBodyPreviewEnabled: true
+    })
+
+    redis.getApiKey.mockResolvedValue({ name: 'Key' })
+    openaiAccountService.getAccount.mockResolvedValue({ name: 'Acct' })
+
+    const recordsByKey = {}
+    const pointerEntries = []
+    for (let i = 0; i < 2; i++) {
+      const ts = Date.now() - (1 - i) * 3600000
+      pointerEntries.push(`req_${i}`, String(ts))
+      recordsByKey[`request_detail:item:req_${i}`] = JSON.stringify({
+        requestId: `req_${i}`,
+        timestamp: new Date(ts).toISOString(),
+        endpoint: '/v1/messages',
+        method: 'POST',
+        apiKeyId: 'key_1',
+        accountId: 'acct_1',
+        accountType: 'claude',
+        model: 'claude-sonnet-4-20250514',
+        inputTokens: 10,
+        outputTokens: 5,
+        totalTokens: 15,
+        cost: 0.1,
+        durationMs: 300
+      })
+    }
+
+    const snapshots = new Map()
+    const client = {
+      zrangebyscore: jest.fn().mockResolvedValue(pointerEntries),
+      mget: jest.fn(async (keys) => keys.map((key) => recordsByKey[key] || null)),
+      set: jest.fn(async (key, value) => {
+        snapshots.set(key, value)
+        return 'OK'
+      }),
+      get: jest.fn(async (key) => snapshots.get(key) || null),
+      expire: jest.fn().mockResolvedValue(1)
+    }
+    redis.getClient.mockReturnValue(client)
+
+    // Only startDate, no endDate — the start is clipped to retentionStart
+    // and would drift without moving-boundary-aware snapshot matching.
+    const startOnly = {
+      startDate: '2020-01-01T00:00:00.000Z',
+      pageSize: 1
+    }
+
+    const firstQuery = await requestDetailService.listRequestDetails(startOnly)
+    expect(firstQuery.snapshotId).toBeTruthy()
+
+    jest.advanceTimersByTime(10000)
+
+    // Page 2 with the same startDate-only filter after time advances —
+    // the snapshot should still be reused.
+    const secondQuery = await requestDetailService.listRequestDetails({
+      ...startOnly,
+      snapshotId: firstQuery.snapshotId,
+      page: 2
+    })
+
+    expect(client.zrangebyscore).toHaveBeenCalledTimes(1)
+    expect(secondQuery.snapshotId).toBe(firstQuery.snapshotId)
+  })
+
+  test('listRequestDetails reuses snapshot for endDate-only future queries after time advances', async () => {
+    claudeRelayConfigService.getConfig.mockResolvedValue({
+      requestDetailCaptureEnabled: true,
+      requestDetailRetentionHours: 6,
+      requestDetailBodyPreviewEnabled: true
+    })
+
+    redis.getApiKey.mockResolvedValue({ name: 'Key' })
+    openaiAccountService.getAccount.mockResolvedValue({ name: 'Acct' })
+
+    const recordsByKey = {}
+    const pointerEntries = []
+    for (let i = 0; i < 2; i++) {
+      const ts = Date.now() - (1 - i) * 3600000
+      pointerEntries.push(`req_${i}`, String(ts))
+      recordsByKey[`request_detail:item:req_${i}`] = JSON.stringify({
+        requestId: `req_${i}`,
+        timestamp: new Date(ts).toISOString(),
+        endpoint: '/v1/messages',
+        method: 'POST',
+        apiKeyId: 'key_1',
+        accountId: 'acct_1',
+        accountType: 'claude',
+        model: 'claude-sonnet-4-20250514',
+        inputTokens: 10,
+        outputTokens: 5,
+        totalTokens: 15,
+        cost: 0.1,
+        durationMs: 300
+      })
+    }
+
+    const snapshots = new Map()
+    const client = {
+      zrangebyscore: jest.fn().mockResolvedValue(pointerEntries),
+      mget: jest.fn(async (keys) => keys.map((key) => recordsByKey[key] || null)),
+      set: jest.fn(async (key, value) => {
+        snapshots.set(key, value)
+        return 'OK'
+      }),
+      get: jest.fn(async (key) => snapshots.get(key) || null),
+      expire: jest.fn().mockResolvedValue(1)
+    }
+    redis.getClient.mockReturnValue(client)
+
+    const endOnly = {
+      endDate: new Date(Date.now() + 3600000).toISOString(),
+      pageSize: 1
+    }
+
+    const firstQuery = await requestDetailService.listRequestDetails(endOnly)
+    expect(firstQuery.snapshotId).toBeTruthy()
+
+    jest.advanceTimersByTime(10000)
+
+    const secondQuery = await requestDetailService.listRequestDetails({
+      ...endOnly,
+      snapshotId: firstQuery.snapshotId,
+      page: 2
+    })
+
+    expect(client.zrangebyscore).toHaveBeenCalledTimes(1)
+    expect(secondQuery.snapshotId).toBe(firstQuery.snapshotId)
+  })
+
+  test('listRequestDetails invalidates snapshot when retentionHours changes', async () => {
+    const makeConfig = (hours) => ({
+      requestDetailCaptureEnabled: true,
+      requestDetailRetentionHours: hours,
+      requestDetailBodyPreviewEnabled: true
+    })
+
+    claudeRelayConfigService.getConfig.mockResolvedValue(makeConfig(6))
+
+    redis.getApiKey.mockResolvedValue({ name: 'Key' })
+    openaiAccountService.getAccount.mockResolvedValue({ name: 'Acct' })
+
+    const recordsByKey = {}
+    const pointerEntries = []
+    for (let i = 0; i < 4; i++) {
+      const ts = Date.now() - (3 - i) * 3600000
+      pointerEntries.push(`req_${i}`, String(ts))
+      recordsByKey[`request_detail:item:req_${i}`] = JSON.stringify({
+        requestId: `req_${i}`,
+        timestamp: new Date(ts).toISOString(),
+        endpoint: '/v1/messages',
+        method: 'POST',
+        apiKeyId: 'key_1',
+        accountId: 'acct_1',
+        accountType: 'claude',
+        model: 'claude-sonnet-4-20250514',
+        inputTokens: 10,
+        outputTokens: 5,
+        totalTokens: 15,
+        cost: 0.1,
+        durationMs: 300
+      })
+    }
+
+    const snapshots = new Map()
+    const client = {
+      zrangebyscore: jest.fn().mockResolvedValue(pointerEntries),
+      mget: jest.fn(async (keys) => keys.map((key) => recordsByKey[key] || null)),
+      set: jest.fn(async (key, value) => {
+        snapshots.set(key, value)
+        return 'OK'
+      }),
+      get: jest.fn(async (key) => snapshots.get(key) || null),
+      expire: jest.fn().mockResolvedValue(1)
+    }
+    redis.getClient.mockReturnValue(client)
+
+    // Page 1 with retentionHours=6
+    const firstQuery = await requestDetailService.listRequestDetails({
+      pageSize: 2,
+      page: 1
+    })
+    expect(firstQuery.snapshotId).toBeTruthy()
+
+    // Admin changes retention from 6 to 2 while snapshot is alive
+    claudeRelayConfigService.getConfig.mockResolvedValue(makeConfig(2))
+
+    // Page 2 with stale snapshotId — must NOT reuse old snapshot
+    const secondQuery = await requestDetailService.listRequestDetails({
+      pageSize: 2,
+      page: 2,
+      snapshotId: firstQuery.snapshotId
+    })
+
+    expect(client.zrangebyscore).toHaveBeenCalledTimes(2)
+    expect(secondQuery.snapshotId).not.toBe(firstQuery.snapshotId)
+  })
+
+  test('listRequestDetails normalizes whitespace in structured filter values', async () => {
+    claudeRelayConfigService.getConfig.mockResolvedValue({
+      requestDetailCaptureEnabled: true,
+      requestDetailRetentionHours: 6,
+      requestDetailBodyPreviewEnabled: true
+    })
+
+    redis.getApiKey.mockResolvedValue({ name: 'Key' })
+    openaiAccountService.getAccount.mockResolvedValue({ name: 'Acct' })
+
+    const ts = Date.now() - 3600000
+    const pointerEntries = ['req_0', String(ts)]
+    const recordsByKey = {
+      'request_detail:item:req_0': JSON.stringify({
+        requestId: 'req_0',
+        timestamp: new Date(ts).toISOString(),
+        endpoint: '/v1/messages',
+        method: 'POST',
+        apiKeyId: 'key_1',
+        accountId: 'acct_1',
+        accountType: 'claude',
+        model: 'claude-sonnet-4-20250514',
+        inputTokens: 10,
+        outputTokens: 5,
+        totalTokens: 15,
+        cost: 0.1,
+        durationMs: 300
+      })
+    }
+
+    const client = {
+      zrangebyscore: jest.fn().mockResolvedValue(pointerEntries),
+      mget: jest.fn(async (keys) => keys.map((key) => recordsByKey[key] || null)),
+      set: jest.fn().mockResolvedValue('OK'),
+      get: jest.fn().mockResolvedValue(null),
+      expire: jest.fn().mockResolvedValue(1)
+    }
+    redis.getClient.mockReturnValue(client)
+
+    // Filter with leading/trailing whitespace must still match records
+    const result = await requestDetailService.listRequestDetails({
+      apiKeyId: '  key_1  '
+    })
+
+    expect(result.pagination.totalRecords).toBe(1)
+    expect(result.records).toHaveLength(1)
+    expect(result.filters.apiKeyId).toBe('key_1')
+  })
+
+  test('listRequestDetails skips snapshot creation when result count exceeds the limit', async () => {
+    claudeRelayConfigService.getConfig.mockResolvedValue({
+      requestDetailCaptureEnabled: true,
+      requestDetailRetentionHours: 6,
+      requestDetailBodyPreviewEnabled: true
+    })
+
+    const client = {
+      set: jest.fn()
+    }
+    redis.getClient.mockReturnValue(client)
+
+    const buildQuerySpy = jest
+      .spyOn(requestDetailService, '_buildListQueryData')
+      .mockResolvedValue({
+        hasSourceRecords: true,
+        matchedPointers: Array.from({ length: 25001 }, (_, index) => ({
+          requestId: `req_${index}`,
+          timestampMs: 1775563200000 + index
+        })),
+        availableFilters: {
+          apiKeys: [],
+          accounts: [],
+          models: [],
+          endpoints: [],
+          dateRange: {
+            earliest: null,
+            latest: null
+          }
+        },
+        summary: {
+          totalRequests: 25001,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreateTokens: 0,
+          totalCost: 0,
+          avgDurationMs: 0,
+          cacheHitRate: 0,
+          cacheCreateNotApplicable: false
+        }
+      })
+    const buildPageSpy = jest.spyOn(requestDetailService, '_buildPageRecords').mockResolvedValue([])
+
+    try {
+      const result = await requestDetailService.listRequestDetails({
+        startDate: '2026-04-07T00:00:00.000Z',
+        endDate: '2026-04-07T23:59:59.000Z'
+      })
+
+      expect(result.snapshotId).toBeNull()
+      expect(client.set).not.toHaveBeenCalled()
+    } finally {
+      buildQuerySpy.mockRestore()
+      buildPageSpy.mockRestore()
+    }
+  })
+
+  test('listRequestDetails skips snapshot creation when payload size exceeds the limit', async () => {
+    claudeRelayConfigService.getConfig.mockResolvedValue({
+      requestDetailCaptureEnabled: true,
+      requestDetailRetentionHours: 6,
+      requestDetailBodyPreviewEnabled: true
+    })
+
+    const client = {
+      set: jest.fn()
+    }
+    redis.getClient.mockReturnValue(client)
+
+    const buildQuerySpy = jest
+      .spyOn(requestDetailService, '_buildListQueryData')
+      .mockResolvedValue({
+        hasSourceRecords: true,
+        matchedPointers: [{ requestId: 'req_1', timestampMs: 1775563200000 }],
+        availableFilters: {
+          apiKeys: [],
+          accounts: [],
+          models: [`model_${'x'.repeat(2 * 1024 * 1024)}`],
+          endpoints: [],
+          dateRange: {
+            earliest: null,
+            latest: null
+          }
+        },
+        summary: {
+          totalRequests: 1,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreateTokens: 0,
+          totalCost: 0,
+          avgDurationMs: 0,
+          cacheHitRate: 0,
+          cacheCreateNotApplicable: false
+        }
+      })
+    const buildPageSpy = jest.spyOn(requestDetailService, '_buildPageRecords').mockResolvedValue([])
+
+    try {
+      const result = await requestDetailService.listRequestDetails({
+        startDate: '2026-04-07T00:00:00.000Z',
+        endDate: '2026-04-07T23:59:59.000Z'
+      })
+
+      expect(result.snapshotId).toBeNull()
+      expect(client.set).not.toHaveBeenCalled()
+    } finally {
+      buildQuerySpy.mockRestore()
+      buildPageSpy.mockRestore()
+    }
+  })
+
+  test('listRequestDetails degrades gracefully when snapshot write fails', async () => {
+    claudeRelayConfigService.getConfig.mockResolvedValue({
+      requestDetailCaptureEnabled: true,
+      requestDetailRetentionHours: 6,
+      requestDetailBodyPreviewEnabled: true
+    })
+
+    redis.getApiKey.mockResolvedValue({ name: 'Primary Key' })
+    openaiAccountService.getAccount.mockResolvedValue({ name: 'OpenAI Main' })
+
+    const ts = 1775563200000
+    const client = {
+      zrangebyscore: jest.fn().mockResolvedValue(['req_1', String(ts)]),
+      mget: jest.fn().mockResolvedValue([
+        JSON.stringify({
+          requestId: 'req_1',
+          timestamp: new Date(ts).toISOString(),
+          endpoint: '/openai/v1/responses',
+          method: 'POST',
+          apiKeyId: 'key_1',
+          accountId: 'acct_1',
+          accountType: 'openai',
+          model: 'gpt-5.4',
+          inputTokens: 10,
+          outputTokens: 5,
+          totalTokens: 15,
+          cost: 0.1,
+          durationMs: 400
+        })
+      ]),
+      set: jest.fn().mockRejectedValue(new Error('READONLY'))
+    }
+    redis.getClient.mockReturnValue(client)
+
+    const result = await requestDetailService.listRequestDetails({
+      startDate: '2026-04-07T00:00:00.000Z',
+      endDate: '2026-04-07T23:59:59.000Z'
+    })
+
+    expect(result.snapshotId).toBeNull()
+    expect(result.records).toHaveLength(1)
+    expect(result.records[0].requestId).toBe('req_1')
+  })
+
+  test('listRequestDetails falls back to full query when snapshot read fails', async () => {
+    claudeRelayConfigService.getConfig.mockResolvedValue({
+      requestDetailCaptureEnabled: true,
+      requestDetailRetentionHours: 6,
+      requestDetailBodyPreviewEnabled: true
+    })
+
+    redis.getApiKey.mockResolvedValue({ name: 'Primary Key' })
+    openaiAccountService.getAccount.mockResolvedValue({ name: 'OpenAI Main' })
+
+    const recordsByKey = {}
+    const pointerEntries = []
+    for (let i = 0; i < 3; i++) {
+      const ts = 1775563200000 + i * 3600000
+      pointerEntries.push(`req_${i}`, String(ts))
+      recordsByKey[`request_detail:item:req_${i}`] = JSON.stringify({
+        requestId: `req_${i}`,
+        timestamp: new Date(ts).toISOString(),
+        endpoint: '/openai/v1/responses',
+        method: 'POST',
+        apiKeyId: 'key_1',
+        accountId: 'acct_1',
+        accountType: 'openai',
+        model: 'gpt-5.4',
+        inputTokens: 10,
+        outputTokens: 5,
+        totalTokens: 15,
+        cost: 0.1,
+        durationMs: 400
+      })
+    }
+
+    const client = {
+      zrangebyscore: jest.fn().mockResolvedValue(pointerEntries),
+      mget: jest.fn(async (keys) => keys.map((key) => recordsByKey[key] || null)),
+      get: jest.fn().mockRejectedValue(new Error('ETIMEDOUT')),
+      set: jest.fn().mockResolvedValue('OK')
+    }
+    redis.getClient.mockReturnValue(client)
+
+    const result = await requestDetailService.listRequestDetails({
+      startDate: '2026-04-07T00:00:00.000Z',
+      endDate: '2026-04-08T23:59:59.000Z',
+      snapshotId: 'rds_stale_id'
+    })
+
+    expect(result.records).toHaveLength(3)
+    expect(client.get).toHaveBeenCalledWith('request_detail:query_snapshot:rds_stale_id')
+    // Falls back to full query, so zrangebyscore must have been called
+    expect(client.zrangebyscore).toHaveBeenCalledTimes(1)
+  })
+
+  test('listRequestDetails still returns snapshot data when TTL renewal fails', async () => {
+    claudeRelayConfigService.getConfig.mockResolvedValue({
+      requestDetailCaptureEnabled: true,
+      requestDetailRetentionHours: 6,
+      requestDetailBodyPreviewEnabled: true
+    })
+
+    redis.getApiKey.mockResolvedValue({ name: 'Primary Key' })
+    openaiAccountService.getAccount.mockResolvedValue({ name: 'OpenAI Main' })
+
+    const recordsByKey = {}
+    const pointerEntries = []
+    for (let i = 0; i < 4; i++) {
+      const ts = 1775563200000 + i * 3600000
+      pointerEntries.push(`req_${i}`, String(ts))
+      recordsByKey[`request_detail:item:req_${i}`] = JSON.stringify({
+        requestId: `req_${i}`,
+        timestamp: new Date(ts).toISOString(),
+        endpoint: '/openai/v1/responses',
+        method: 'POST',
+        apiKeyId: 'key_1',
+        accountId: 'acct_1',
+        accountType: 'openai',
+        model: 'gpt-5.4',
+        inputTokens: 100,
+        outputTokens: 50,
+        totalTokens: 150,
+        cost: 0.5,
+        durationMs: 1200
+      })
+    }
+
+    const snapshots = new Map()
+    const client = {
+      zrangebyscore: jest.fn().mockResolvedValue(pointerEntries),
+      mget: jest.fn(async (keys) => keys.map((key) => recordsByKey[key] || null)),
+      set: jest.fn(async (key, value) => {
+        snapshots.set(key, value)
+        return 'OK'
+      }),
+      get: jest.fn(async (key) => snapshots.get(key) || null),
+      expire: jest.fn().mockRejectedValue(new Error('NOPERM'))
+    }
+    redis.getClient.mockReturnValue(client)
+
+    const firstPage = await requestDetailService.listRequestDetails({
+      startDate: '2026-04-07T00:00:00.000Z',
+      endDate: '2026-04-08T23:59:59.000Z',
+      pageSize: 2,
+      page: 1
+    })
+
+    expect(firstPage.snapshotId).toBeTruthy()
+
+    const secondPage = await requestDetailService.listRequestDetails({
+      startDate: '2026-04-07T00:00:00.000Z',
+      endDate: '2026-04-08T23:59:59.000Z',
+      pageSize: 2,
+      page: 2,
+      snapshotId: firstPage.snapshotId
+    })
+
+    expect(secondPage.snapshotId).toBe(firstPage.snapshotId)
+    expect(secondPage.records.map((record) => record.requestId)).toEqual(['req_1', 'req_0'])
+    // Snapshot was reused despite expire failure — no full re-query
+    expect(client.zrangebyscore).toHaveBeenCalledTimes(1)
+  })
+
+  test('listRequestDetails reuses snapshot after time-window trimming', async () => {
+    claudeRelayConfigService.getConfig.mockResolvedValue({
+      requestDetailCaptureEnabled: true,
+      requestDetailRetentionHours: 6,
+      requestDetailBodyPreviewEnabled: true
+    })
+
+    redis.getApiKey.mockResolvedValue({ name: 'Primary Key' })
+    openaiAccountService.getAccount.mockResolvedValue({ name: 'OpenAI Main' })
+
+    const recordsByKey = {}
+    const pointerEntries = []
+    for (let i = 0; i < 4; i++) {
+      const ts = 1775563200000 + i * 3600000
+      pointerEntries.push(`req_${i}`, String(ts))
+      recordsByKey[`request_detail:item:req_${i}`] = JSON.stringify({
+        requestId: `req_${i}`,
+        timestamp: new Date(ts).toISOString(),
+        endpoint: '/openai/v1/responses',
+        method: 'POST',
+        apiKeyId: 'key_1',
+        accountId: 'acct_1',
+        accountType: 'openai',
+        model: 'gpt-5.4',
+        inputTokens: 100,
+        outputTokens: 50,
+        totalTokens: 150,
+        cost: 0.5,
+        durationMs: 1200
+      })
+    }
+
+    const snapshots = new Map()
+    const client = {
+      zrangebyscore: jest.fn().mockResolvedValue(pointerEntries),
+      mget: jest.fn(async (keys) => keys.map((key) => recordsByKey[key] || null)),
+      set: jest.fn(async (key, value) => {
+        snapshots.set(key, value)
+        return 'OK'
+      }),
+      get: jest.fn(async (key) => snapshots.get(key) || null),
+      expire: jest.fn().mockResolvedValue(1)
+    }
+    redis.getClient.mockReturnValue(client)
+
+    // First request with startDate far before retention window — will be trimmed
+    const firstPage = await requestDetailService.listRequestDetails({
+      startDate: '2020-01-01T00:00:00.000Z',
+      endDate: '2026-04-08T23:59:59.000Z',
+      pageSize: 2,
+      page: 1
+    })
+
+    expect(firstPage.snapshotId).toBeTruthy()
+    // The response echoes back the trimmed start date
+    const trimmedStart = firstPage.filters.startDate
+
+    jest.advanceTimersByTime(10000)
+
+    // Second request uses trimmed dates (as the frontend would after syncResponseState)
+    const secondPage = await requestDetailService.listRequestDetails({
+      startDate: trimmedStart,
+      endDate: firstPage.filters.endDate,
+      pageSize: 2,
+      page: 2,
+      snapshotId: firstPage.snapshotId
+    })
+
+    expect(secondPage.snapshotId).toBe(firstPage.snapshotId)
+    // Full query should run only once
+    expect(client.zrangebyscore).toHaveBeenCalledTimes(1)
+  })
+
+  test('listRequestDetails reuses snapshot for default time window without explicit dates', async () => {
+    claudeRelayConfigService.getConfig.mockResolvedValue({
+      requestDetailCaptureEnabled: true,
+      requestDetailRetentionHours: 6,
+      requestDetailBodyPreviewEnabled: true
+    })
+
+    redis.getApiKey.mockResolvedValue({ name: 'Primary Key' })
+    openaiAccountService.getAccount.mockResolvedValue({ name: 'OpenAI Main' })
+
+    const recordsByKey = {}
+    const pointerEntries = []
+    for (let i = 0; i < 4; i++) {
+      const ts = Date.now() - (3 - i) * 3600000
+      pointerEntries.push(`req_${i}`, String(ts))
+      recordsByKey[`request_detail:item:req_${i}`] = JSON.stringify({
+        requestId: `req_${i}`,
+        timestamp: new Date(ts).toISOString(),
+        endpoint: '/openai/v1/responses',
+        method: 'POST',
+        apiKeyId: 'key_1',
+        accountId: 'acct_1',
+        accountType: 'openai',
+        model: 'gpt-5.4',
+        inputTokens: 100,
+        outputTokens: 50,
+        totalTokens: 150,
+        cost: 0.5,
+        durationMs: 1200
+      })
+    }
+
+    const snapshots = new Map()
+    const client = {
+      zrangebyscore: jest.fn().mockResolvedValue(pointerEntries),
+      mget: jest.fn(async (keys) => keys.map((key) => recordsByKey[key] || null)),
+      set: jest.fn(async (key, value) => {
+        snapshots.set(key, value)
+        return 'OK'
+      }),
+      get: jest.fn(async (key) => snapshots.get(key) || null),
+      expire: jest.fn().mockResolvedValue(1)
+    }
+    redis.getClient.mockReturnValue(client)
+
+    // First page — no startDate / endDate (default rolling window)
+    const firstPage = await requestDetailService.listRequestDetails({
+      pageSize: 2,
+      page: 1
+    })
+
+    expect(firstPage.snapshotId).toBeTruthy()
+
+    jest.advanceTimersByTime(10000)
+
+    // Second page — still no dates, only snapshotId; the server's new Date()
+    // will produce different effective timestamps, but the snapshot should
+    // still be reused because dates are excluded from the filter signature.
+    const secondPage = await requestDetailService.listRequestDetails({
+      pageSize: 2,
+      page: 2,
+      snapshotId: firstPage.snapshotId
+    })
+
+    expect(secondPage.snapshotId).toBe(firstPage.snapshotId)
+    expect(client.zrangebyscore).toHaveBeenCalledTimes(1)
+  })
+
+  test('listRequestDetails clamps out-of-range pages without rerunning the full query', async () => {
+    claudeRelayConfigService.getConfig.mockResolvedValue({
+      requestDetailCaptureEnabled: true,
+      requestDetailRetentionHours: 6,
+      requestDetailBodyPreviewEnabled: true
+    })
+
+    redis.getApiKey.mockResolvedValue({ name: 'Primary Key' })
+    openaiAccountService.getAccount.mockResolvedValue({ name: 'OpenAI Main' })
+
+    const recordsByKey = {}
+    const pointerEntries = []
+    for (let i = 0; i < 3; i++) {
+      const ts = 1775563200000 + i * 3600000
+      pointerEntries.push(`req_${i}`, String(ts))
+      recordsByKey[`request_detail:item:req_${i}`] = JSON.stringify({
+        requestId: `req_${i}`,
+        timestamp: new Date(ts).toISOString(),
+        endpoint: '/openai/v1/responses',
+        method: 'POST',
+        apiKeyId: 'key_1',
+        accountId: 'acct_1',
+        accountType: 'openai',
+        model: 'gpt-5.4',
+        inputTokens: 10,
+        outputTokens: 5,
+        totalTokens: 15,
+        cost: 0.1,
+        durationMs: 400
+      })
+    }
+
+    const client = {
+      zrangebyscore: jest.fn().mockResolvedValue(pointerEntries),
+      mget: jest.fn(async (keys) => keys.map((key) => recordsByKey[key] || null)),
+      set: jest.fn().mockResolvedValue('OK')
+    }
+    redis.getClient.mockReturnValue(client)
+
+    const result = await requestDetailService.listRequestDetails({
+      startDate: '2026-04-07T00:00:00.000Z',
+      endDate: '2026-04-08T23:59:59.000Z',
+      pageSize: 2,
+      page: 9
+    })
+
+    expect(result.pagination.currentPage).toBe(2)
+    expect(result.pagination.totalPages).toBe(2)
+    expect(result.records.map((record) => record.requestId)).toEqual(['req_0'])
+    expect(client.zrangebyscore).toHaveBeenCalledTimes(1)
   })
 
   test('listRequestDetails backfills invalid timestamps from day-index scores', async () => {
