@@ -8,6 +8,7 @@ const unifiedClaudeScheduler = require('../scheduler/unifiedClaudeScheduler')
 const sessionHelper = require('../../utils/sessionHelper')
 const logger = require('../../utils/logger')
 const config = require('../../../config/config')
+const { getRateLimitModelFamily } = require('../../utils/modelHelper')
 const claudeCodeHeadersService = require('../claudeCodeHeadersService')
 const redis = require('../../models/redis')
 const ClaudeCodeValidator = require('../../validators/clients/claudeCodeValidator')
@@ -472,8 +473,9 @@ class ClaudeRelayService {
         requestedModel: requestBody.model
       })
 
-      const isOpusModelRequest =
-        typeof requestBody?.model === 'string' && requestBody.model.toLowerCase().includes('opus')
+      // 请求模型所属的限流家族（opus/sonnet/haiku/fable），决定 429 记入哪个限流桶
+      const requestModelFamily = getRateLimitModelFamily(requestBody?.model)
+      const isOpusModelRequest = requestModelFamily === 'opus'
 
       // 生成会话哈希用于sticky会话
       const sessionHash = sessionHelper.generateSessionHash(requestBody)
@@ -498,6 +500,20 @@ class ClaudeRelayService {
             body: JSON.stringify({
               error: 'upstream_rate_limited',
               message: limitMessage
+            }),
+            accountId: error.accountId
+          }
+        }
+        if (error.code === 'CLAUDE_DEDICATED_UNAVAILABLE') {
+          logger.warn(
+            `🚫 Dedicated account ${error.accountId} is unavailable (${error.reason}) for API key ${apiKeyData.name}, returning 503`
+          )
+          return {
+            statusCode: 503,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              error: 'dedicated_account_unavailable',
+              message: `该 API Key 绑定的专属账号当前不可用（${error.reason}），请稍后重试。`
             }),
             accountId: error.accountId
           }
@@ -830,13 +846,18 @@ class ClaudeRelayService {
               : null
             const parsedResetTimestamp = resetHeader ? parseInt(resetHeader, 10) : NaN
 
-            if (isOpusModelRequest && !Number.isNaN(parsedResetTimestamp)) {
-              await claudeAccountService.markAccountOpusRateLimited(accountId, parsedResetTimestamp)
+            if (requestModelFamily && !Number.isNaN(parsedResetTimestamp)) {
+              // 模型级限额：只停用该模型家族，不改写为账号级限流
+              await claudeAccountService.markAccountModelRateLimited(
+                accountId,
+                requestModelFamily,
+                parsedResetTimestamp
+              )
               logger.warn(
-                `🚫 Account ${accountId} hit Opus limit, resets at ${new Date(parsedResetTimestamp * 1000).toISOString()}`
+                `🚫 Account ${accountId} hit ${requestModelFamily} limit, resets at ${new Date(parsedResetTimestamp * 1000).toISOString()}`
               )
 
-              if (isDedicatedOfficialAccount) {
+              if (isOpusModelRequest && isDedicatedOfficialAccount) {
                 const limitMessage = this._buildOpusLimitMessage(parsedResetTimestamp)
                 return {
                   statusCode: 403,
@@ -856,7 +877,9 @@ class ClaudeRelayService {
                   `🕐 Extracted rate limit reset timestamp: ${rateLimitResetTimestamp} (${new Date(rateLimitResetTimestamp * 1000).toISOString()})`
                 )
               }
-              if (isDedicatedOfficialAccount) {
+              // 仅在拿到权威 reset 头时构建专属限流提示；无 reset 头的 429 大概率不是真实限流，
+              // 直接透传上游错误，避免被改写为 403 "upstream_rate_limited" 误导客户端
+              if (isDedicatedOfficialAccount && rateLimitResetTimestamp) {
                 dedicatedRateLimitMessage = this._buildStandardRateLimitMessage(
                   rateLimitResetTimestamp || account?.rateLimitEndAt
                 )
@@ -897,29 +920,36 @@ class ClaudeRelayService {
               `🚫 Agent View auxiliary request hit 429 for account ${accountId}; skipping account-level rate-limit marking`
             )
           } else {
-            if (isDedicatedOfficialAccount && !dedicatedRateLimitMessage) {
-              dedicatedRateLimitMessage = this._buildStandardRateLimitMessage(
-                rateLimitResetTimestamp || account?.rateLimitEndAt
+            if (!rateLimitResetTimestamp) {
+              // 无权威 reset 头的 429 大概率不是真实限流，不标记账号、不进入冷却，直接透传错误
+              logger.warn(
+                `⚠️ Rate limit without reset header for account ${accountId}, status: ${response.statusCode}, skipping rate limit marking`
               )
-            }
-            logger.warn(
-              `🚫 Rate limit detected for account ${accountId}, status: ${response.statusCode}`
-            )
-            // 标记账号为限流状态并删除粘性会话映射，传递准确的重置时间戳
-            await unifiedClaudeScheduler.markAccountRateLimited(
-              accountId,
-              accountType,
-              sessionHash,
-              rateLimitResetTimestamp
-            )
-            await upstreamErrorHelper
-              .markTempUnavailable(
+            } else {
+              if (isDedicatedOfficialAccount && !dedicatedRateLimitMessage) {
+                dedicatedRateLimitMessage = this._buildStandardRateLimitMessage(
+                  rateLimitResetTimestamp || account?.rateLimitEndAt
+                )
+              }
+              logger.warn(
+                `🚫 Rate limit detected for account ${accountId}, status: ${response.statusCode}`
+              )
+              // 标记账号为限流状态并删除粘性会话映射，传递准确的重置时间戳
+              await unifiedClaudeScheduler.markAccountRateLimited(
                 accountId,
                 accountType,
-                429,
-                upstreamErrorHelper.parseRetryAfter(response.headers)
+                sessionHash,
+                rateLimitResetTimestamp
               )
-              .catch(() => {})
+              await upstreamErrorHelper
+                .markTempUnavailable(
+                  accountId,
+                  accountType,
+                  429,
+                  upstreamErrorHelper.parseRetryAfter(response.headers)
+                )
+                .catch(() => {})
+            }
           }
 
           if (dedicatedRateLimitMessage) {
@@ -1873,6 +1903,23 @@ class ClaudeRelayService {
           responseStream.end()
           return
         }
+        if (error.code === 'CLAUDE_DEDICATED_UNAVAILABLE') {
+          logger.warn(
+            `🚫 [Stream] Dedicated account ${error.accountId} is unavailable (${error.reason}) for API key ${apiKeyData.name}, returning 503`
+          )
+          if (!responseStream.headersSent) {
+            responseStream.status(503)
+            responseStream.setHeader('Content-Type', 'application/json')
+          }
+          responseStream.write(
+            JSON.stringify({
+              error: 'dedicated_account_unavailable',
+              message: `该 API Key 绑定的专属账号当前不可用（${error.reason}），请稍后重试。`
+            })
+          )
+          responseStream.end()
+          return
+        }
         throw error
       }
       const { accountId } = accountSelection
@@ -2095,8 +2142,9 @@ class ClaudeRelayService {
     // 获取账户信息用于统一 User-Agent
     const account = await claudeAccountService.getAccount(accountId)
 
-    const isOpusModelRequest =
-      typeof body?.model === 'string' && body.model.toLowerCase().includes('opus')
+    // 请求模型所属的限流家族（opus/sonnet/haiku/fable），决定 429 记入哪个限流桶
+    const requestModelFamily = getRateLimitModelFamily(body?.model)
+    const isOpusModelRequest = requestModelFamily === 'opus'
 
     // 使用公共方法准备请求头和 payload
     const prepared = await this._prepareRequestHeadersAndPayload(
@@ -2202,18 +2250,20 @@ class ClaudeRelayService {
               : null
             const parsedResetTimestamp = resetHeader ? parseInt(resetHeader, 10) : NaN
 
-            if (isOpusModelRequest) {
+            if (requestModelFamily) {
               if (!Number.isNaN(parsedResetTimestamp)) {
-                await claudeAccountService.markAccountOpusRateLimited(
+                // 模型级限额：只停用该模型家族，不改写为账号级限流
+                await claudeAccountService.markAccountModelRateLimited(
                   accountId,
+                  requestModelFamily,
                   parsedResetTimestamp
                 )
                 logger.warn(
-                  `🚫 [Stream] Account ${accountId} hit Opus limit, resets at ${new Date(parsedResetTimestamp * 1000).toISOString()}`
+                  `🚫 [Stream] Account ${accountId} hit ${requestModelFamily} limit, resets at ${new Date(parsedResetTimestamp * 1000).toISOString()}`
                 )
               }
 
-              if (isDedicatedOfficialAccount) {
+              if (isOpusModelRequest && isDedicatedOfficialAccount) {
                 const limitMessage = this._buildOpusLimitMessage(parsedResetTimestamp)
                 if (!responseStream.headersSent) {
                   responseStream.status(403)
@@ -2241,6 +2291,11 @@ class ClaudeRelayService {
                 logger.warn(
                   `🚫 [Stream] Agent View auxiliary request hit 429 for account ${accountId}; skipping account-level rate-limit marking`
                 )
+              } else if (!rateLimitResetTimestamp) {
+                // 无权威 reset 头的 429 大概率不是真实限流，不标记账号、不进入冷却，直接透传错误
+                logger.warn(
+                  `⚠️ [Stream] 429 without reset header for account ${accountId}, skipping rate limit marking`
+                )
               } else {
                 await unifiedClaudeScheduler.markAccountRateLimited(
                   accountId,
@@ -2259,7 +2314,13 @@ class ClaudeRelayService {
                 logger.warn(`🚫 [Stream] Rate limit detected for account ${accountId}, status 429`)
               }
 
-              if (isDedicatedOfficialAccount && !isAgentViewAuxiliaryRequest) {
+              // 仅在拿到权威 reset 头时才把 429 改写为 403 "upstream_rate_limited"；
+              // 无 reset 头的 429 直接透传上游错误，避免客户端误判为权限问题（如提示 /login）
+              if (
+                isDedicatedOfficialAccount &&
+                !isAgentViewAuxiliaryRequest &&
+                rateLimitResetTimestamp
+              ) {
                 const limitMessage = this._buildStandardRateLimitMessage(
                   rateLimitResetTimestamp || account?.rateLimitEndAt
                 )
@@ -2891,27 +2952,35 @@ class ClaudeRelayService {
               : null
             const parsedResetTimestamp = resetHeader ? parseInt(resetHeader, 10) : NaN
 
-            if (isOpusModelRequest && !Number.isNaN(parsedResetTimestamp)) {
-              await claudeAccountService.markAccountOpusRateLimited(accountId, parsedResetTimestamp)
+            if (requestModelFamily && !Number.isNaN(parsedResetTimestamp)) {
+              // 模型级限额：只停用该模型家族，不改写为账号级限流
+              await claudeAccountService.markAccountModelRateLimited(
+                accountId,
+                requestModelFamily,
+                parsedResetTimestamp
+              )
               logger.warn(
-                `🚫 [Stream] Account ${accountId} hit Opus limit, resets at ${new Date(parsedResetTimestamp * 1000).toISOString()}`
+                `🚫 [Stream] Account ${accountId} hit ${requestModelFamily} limit, resets at ${new Date(parsedResetTimestamp * 1000).toISOString()}`
+              )
+            } else if (this._isAgentViewAuxiliaryRequest(body, clientHeaders)) {
+              logger.warn(
+                `🚫 [Stream] Agent View auxiliary request hit rate limit at stream end for account ${accountId}; skipping account-level rate-limit marking`
+              )
+            } else if (Number.isNaN(parsedResetTimestamp)) {
+              // 无权威 reset 头的 429 大概率不是真实限流，不标记账号、不进入冷却，直接透传错误
+              logger.warn(
+                `⚠️ [Stream] Rate limit at stream end without reset header for account ${accountId}, skipping rate limit marking`
               )
             } else {
-              const rateLimitResetTimestamp = Number.isNaN(parsedResetTimestamp)
-                ? null
-                : parsedResetTimestamp
-
-              if (!Number.isNaN(parsedResetTimestamp)) {
-                logger.info(
-                  `🕐 Extracted rate limit reset timestamp from stream: ${parsedResetTimestamp} (${new Date(parsedResetTimestamp * 1000).toISOString()})`
-                )
-              }
+              logger.info(
+                `🕐 Extracted rate limit reset timestamp from stream: ${parsedResetTimestamp} (${new Date(parsedResetTimestamp * 1000).toISOString()})`
+              )
 
               await unifiedClaudeScheduler.markAccountRateLimited(
                 accountId,
                 accountType,
                 sessionHash,
-                rateLimitResetTimestamp
+                parsedResetTimestamp
               )
               await upstreamErrorHelper
                 .markTempUnavailable(
